@@ -6,8 +6,26 @@
 """
 Convert ROS2 bag files with X/Y episode markers to LeRobot dataset format v2.1.
 
-This script processes rosbag files that contain multiple episodes marked by operator
-button presses (X button to start, Y button to end recording).
+This script processes rosbag files that contain multiple episodes marked by
+operator button presses (X button to start, Y button to end recording).
+
+The robot's camera streams are H.265 with inter-coded GOPs, so every episode
+is re-encoded such that EVERY output frame is an IDR keyframe (GOP=1 — any
+frame can be decoded independently, which training dataloaders rely on for
+random access). The pipeline stays on the GPU when one is available:
+NVIDIA (NVDEC → NVENC, CUDA frames) or Intel/AMD (VA-API decode → encode,
+frames stay in GPU surfaces). With neither it falls back to libx265 on CPU.
+The backend is auto-detected (override with R2L_VIDEO_BACKEND=nvidia|vaapi|cpu):
+
+  1. Raw camera packets are muxed into a temporary MPEG-TS carrying their
+     real bag timestamps, preserving true camera timing across dropped frames.
+  2. One ffmpeg pass per camera re-encodes to constant fps aligned with the
+     dataset ticks: video frame k is the latest camera frame at data row k's
+     sampling instant, and each video ends up with exactly as many frames as
+     the episode has rows.
+  3. Episodes encode on background workers while the main thread keeps
+     reading the bag; all cameras of an episode encode concurrently and
+     finished episodes are saved in order.
 
 Usage:
     First, ensure the correct Python environment is activated:
@@ -23,7 +41,7 @@ Usage:
         --multibag \
         --input_directory ./data/rosbags \
         --output username/dataset_name \
-        --fps 30 \
+        --fps 45 \
         --task "task description"
     ```
 
@@ -33,7 +51,7 @@ Usage:
     python scripts/convert_rosbag_to_lerobot.py \
         --input_directory ./data/rosbags \
         --output username/dataset_name \
-        --fps 30 \
+        --fps 45 \
         --task "task description"
     ```
 
@@ -47,17 +65,59 @@ Usage:
         --output username/dataset_name \
         --task "task description"
     ```
+
+    Treat an entire bag as one continuous episode (no X/Y markers needed):
+    ```bash
+    python scripts/convert_rosbag_to_lerobot.py \
+        --whole_bag \
+        --input_directory ./data/rosbags \
+        --output username/dataset_name \
+        --task "task description"
+    ```
+
+    Useful options:
+      --head_resolution WxH
+                          size of the head camera video (default 1920x960,
+                          half the 3840x1920 source); "source" keeps it
+      --wrist_resolution WxH
+                          size of both wrist camera videos (default: source
+                          size, 2560x800), e.g. 1280x400
+      --crf N             encoder quality (constant QP on GPU / CRF on CPU,
+                          lower = better quality, default 23)
+      --nvenc_sessions N  max concurrent NVENC sessions (default 7; lower to 5
+                          or 3 on NVIDIA drivers older than 550/522)
+      --vaapi_sessions N  max concurrent VA-API sessions per render node
+                          (default 4; increase only if the GPU is not saturated)
+      --max_episodes N    stop after N episodes (for quick testing)
+      --verbose           print progress to terminal instead of a log file
 """
 
 import os
+import re
 import sys
+import glob
+import time
+import threading
 import numpy as np
 import argparse
 from pathlib import Path
 import logging
 import shutil
+import tempfile
+import subprocess
 import traceback
+from collections import defaultdict, deque
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
+from fractions import Fraction
+
+# PyAV: used to mux raw HEVC packets into MPEG-TS with real bag timestamps
+try:
+    import av
+    av.logging.set_level(av.logging.ERROR)
+except ImportError as e:
+    print(f"PyAV dependency not found: {e}")
+    sys.exit(1)
 
 # ROS2 imports
 try:
@@ -76,34 +136,634 @@ except ImportError as e:
 try:
     from lerobot.record import sample_frames_from_video
     from lerobot.datasets.lerobot_dataset import LeRobotDataset
-    from lerobot.datasets.video_packet_writer import VideoPacketBuffer
 except ImportError as e:
     print(f"LeRobot dependencies not found: {e}")
     sys.exit(1)
 
 # Constants
-STATE_ACTION_DIM = 62
+STATE_ACTION_DIM = 76  # 62 base + 10 chassis/kinco + 4 unpaired (see setup_features)
+# Dims 72-75 have no counterpart on the other side: chassis_target_vel is
+# command-only and kinco_position is feedback-only. The layout stays shared
+# between state and action, so each simply reads 0 where it has no source.
 MIN_EPISODE_LENGTH = 30
-ACTION_OFFSET_RATIO = 1.0 / 3.0
+# State->action capture offset in seconds (also the state-capture window
+# width). Must stay < 1/fps.
+ACTION_OFFSET_S = 1.0 / 90.0
+
+# 3x Y right after stopping = operator marks that episode as failed.
+# Real bags: burst gaps <=5s, distinct-episode gaps >=13s, so 6s separates them.
+Y_FAILURE_TAP_WINDOW_S = 6.0
+Y_FAILURE_TAP_COUNT = 3
+
+
+# =============================================================================
+# HEVC NAL unit utilities (for IDR detection)
+# =============================================================================
+
+_NAL_START3 = b'\x00\x00\x01'
+
+
+def _iter_nal_types(data: bytes):
+    """Yield NAL unit types in annex-B HEVC data (handles 3- and 4-byte start codes)."""
+    pos = data.find(_NAL_START3)
+    n = len(data)
+    while pos != -1 and pos + 3 < n:
+        yield (data[pos + 3] >> 1) & 0x3F
+        pos = data.find(_NAL_START3, pos + 3)
+
+
+def _has_idr(data: bytes) -> bool:
+    """Check if HEVC data contains an IDR NAL unit (type 19 or 20).
+
+    Stops at the first VCL NAL (type < 32): in a single access unit the first
+    VCL NAL determines the picture type, so P-frame packets bail immediately.
+    """
+    for nal_type in _iter_nal_types(data):
+        if nal_type < 32:
+            return nal_type in (19, 20)
+    return False
+
+
+def _detect_gpu_count() -> int:
+    """Count NVIDIA GPUs visible to CUDA (respects CUDA_VISIBLE_DEVICES).
+
+    ffmpeg's -hwaccel_device/-gpu indices live in the same masked CUDA
+    enumeration, so torch.cuda.device_count() (torch is already loaded via
+    lerobot) is the authoritative source; nvidia-smi is only a fallback.
+    """
+    try:
+        import torch
+        return torch.cuda.device_count()
+    except Exception:
+        pass
+    try:
+        result = subprocess.run(["nvidia-smi", "-L"], capture_output=True, text=True, timeout=10)
+        if result.returncode != 0:
+            return 0
+        return sum(1 for line in result.stdout.splitlines() if line.startswith("GPU "))
+    except Exception:
+        return 0
+
+
+def _vaapi_hevc_encode_available(device: str) -> bool:
+    """True if libva opens `device` and the driver exposes HEVC encoding.
+
+    The container ships libva + intel-media-driver, so the driver never has to
+    match host packages; only the kernel render node is borrowed from the host.
+    A machine with an Intel iGPU but a missing/incompatible driver fails here
+    and falls back to CPU instead of failing every episode's GPU attempt.
+    """
+    try:
+        result = subprocess.run(
+            ["vainfo", "--display", "drm", "--device", device],
+            capture_output=True, text=True, timeout=20,
+        )
+        if result.returncode != 0:
+            return False
+        return any(
+            "VAProfileHEVCMain" in line and "VAEntrypointEncSlice" in line
+            for line in result.stdout.splitlines()
+        )
+    except Exception:
+        return False
+
+
+def _detect_video_backend():
+    """Pick the fastest available video pipeline.
+
+    Returns (backend, devices):
+
+      ("nvidia", [0, 1, ...])   NVENC/NVDEC; ffmpeg CUDA device indices
+      ("vaapi", ["/dev/dri/renderD128", ...])   VA-API render nodes
+      ("cpu", [])               libx265 fallback
+
+    NVIDIA wins when both are present. Set R2L_VIDEO_BACKEND=nvidia|vaapi|cpu
+    to force a backend.
+    """
+    forced = os.environ.get("R2L_VIDEO_BACKEND", "").strip().lower()
+    if forced and forced not in ("nvidia", "vaapi", "cpu"):
+        logging.warning(f"Unknown R2L_VIDEO_BACKEND={forced!r}; auto-detecting")
+        forced = ""
+
+    if forced in ("", "nvidia"):
+        nvidia = _detect_gpu_count()
+        if nvidia > 0:
+            return "nvidia", list(range(nvidia))
+        if forced == "nvidia":
+            logging.warning("R2L_VIDEO_BACKEND=nvidia but no NVIDIA GPU is visible")
+
+    if forced in ("", "vaapi"):
+        nodes = sorted(glob.glob("/dev/dri/renderD*"))
+        usable = [node for node in nodes if _vaapi_hevc_encode_available(node)]
+        if usable:
+            return "vaapi", usable
+        if forced == "vaapi":
+            logging.warning(
+                "R2L_VIDEO_BACKEND=vaapi but no VA-API HEVC encoder is available "
+                f"(render nodes: {nodes or 'none'})"
+            )
+
+    return "cpu", []
+
+
+# Resolved once at startup; _get_video_backend() lazy-initialises for library
+# use. The session semaphore gates ffmpeg encode processes so an
+# over-subscribed GPU queues instead of failing over to the slow CPU path.
+# Consumer NVIDIA drivers cap concurrent NVENC sessions system-wide (8 on
+# driver >=550, 5 on 522-549, 3 before that); tune with --nvenc_sessions.
+_VIDEO_BACKEND = None
+_VIDEO_DEVICES = []
+_ENCODE_SESSIONS = threading.BoundedSemaphore(7)
+
+# Intel's CQP at qp N lands close to NVENC at qp N+4 (measured on Arc B-series:
+# VA-API qp19 = 23.9 Mbps / 51.29 dB vs NVENC qp23 = 25.0 Mbps / 51.26 dB).
+# Keeping the same visual quality across the two backends matters because both
+# produce the same dataset.
+_VAAPI_QP_OFFSET = 4
+
+
+def _get_video_backend():
+    """Return (backend, devices), detecting once per process."""
+    global _VIDEO_BACKEND, _VIDEO_DEVICES
+    if _VIDEO_BACKEND is None:
+        _VIDEO_BACKEND, _VIDEO_DEVICES = _detect_video_backend()
+    return _VIDEO_BACKEND, _VIDEO_DEVICES
+
+
+# =============================================================================
+# All-IDR Video Buffer (replaces VideoPacketBuffer)
+# =============================================================================
+
+def normalize_codec_name(codec: str) -> str:
+    """Normalize encoder/codec names to PyAV-compatible codec names."""
+    codec_lower = codec.lower()
+    if any(name in codec_lower for name in ["hevc", "h265", "x265", "hevc_vaapi"]):
+        return "hevc"
+    if any(name in codec_lower for name in ["h264", "avc", "x264"]):
+        return "h264"
+    return codec
+
+
+class AllIdrVideoBuffer:
+    """
+    Buffers pre-encoded video packets (plus their bag timestamps) and re-encodes
+    each episode to MP4 where EVERY frame is an IDR keyframe (GOP=1).
+
+    Per camera the encode pipeline is:
+      1. Mux the raw HEVC packets into a temp MPEG-TS with real PTS taken from
+         the bag timestamps (PyAV, milliseconds of work). This preserves the
+         true 45fps-with-drops timing instead of trusting SPS/VUI nominal rate.
+      2. One ffmpeg pass entirely on the GPU: NVDEC (hevc_cuvid) decode with
+         `-hwaccel_output_format cuda` so frames never leave GPU memory, then
+         NVENC (hevc_nvenc) all-IDR encode. The output is CFR-resampled to the
+         dataset fps, aligned to the episode's first state tick via `-ss`, and
+         capped to exactly `episode_length` frames so video frame k matches
+         data row k.
+    All cameras of an episode run concurrently (one ffmpeg process each); the
+    stereo cameras finish well inside the head camera's encode time.
+
+    Example:
+        ```python
+        buffer = AllIdrVideoBuffer(root_dir="dataset", fps=45)
+        buffer.add_packet("left_color", pkt, width=2560, height=800, codec="hevc", ts=bag_t)
+        buffer.encode_episode(episode_index=0, dataset_meta=meta,
+                              first_tick_time=start + 1/45, episode_length=900)
+        ```
+    """
+
+    def __init__(self, root_dir: Path, fps: int, crf: int = 23, preset: str = "ultrafast",
+                 output_sizes: dict = None):
+        """
+        Initialize all-IDR video buffer.
+
+        Args:
+            root_dir: Root directory for the dataset
+            fps: Frames per second for video
+            crf: Quantizer for hevc_nvenc (-qp) / CRF for the libx265 CPU fallback
+            preset: libx265 preset for the CPU fallback (GPU path always uses p1)
+            output_sizes: {camera_name: (width, height)} for cameras to resize
+                while encoding; other cameras keep their source size
+        """
+        self.root_dir = Path(root_dir)
+        self.fps = fps
+        self.crf = crf
+        self.preset = preset
+        self.output_sizes = dict(output_sizes or {})
+
+        # Buffer: {camera_name: [packet_dict, ...]}
+        self.packets = defaultdict(list)
+
+        # Video info: {camera_name: dict}
+        self.video_info = {}
+
+    def add_packet(
+        self, camera_name: str, packet_data: bytes,
+        width: int, height: int, codec: str,
+        ts: float = 0.0,
+    ) -> None:
+        """
+        Add a packet to the buffer.
+
+        Args:
+            camera_name: Name of the camera
+            packet_data: Raw packet bytes
+            width: Video width
+            height: Video height
+            codec: Codec name (e.g., "hevc", "h264")
+            ts: Bag timestamp of the packet in seconds (drives output PTS)
+        """
+        # Store video info from first packet
+        if camera_name not in self.video_info:
+            normalized_codec = normalize_codec_name(codec)
+            self.video_info[camera_name] = {
+                'width': width,
+                'height': height,
+                'codec': normalized_codec,
+            }
+
+        # Buffer packet data
+        self.packets[camera_name].append({
+            "data": packet_data,
+            "ts": ts,
+        })
+
+    def _mux_to_ts(self, packet_list, info) -> str:
+        """Mux raw annex-B packets into a temp MPEG-TS with PTS from bag timestamps."""
+        # Prefer RAM-backed /dev/shm: the .ts is a pure intermediate that
+        # ffmpeg reads back immediately, no reason to round-trip the disk
+        tmp_dir = "/dev/shm" if os.path.isdir("/dev/shm") else None
+        fd, ts_path = tempfile.mkstemp(suffix=".ts", prefix="lerobot_ep_", dir=tmp_dir)
+        os.close(fd)
+        container = av.open(ts_path, "w", format="mpegts")
+        stream = container.add_stream(info['codec'])
+        stream.width = info['width']
+        stream.height = info['height']
+        if info['codec'] == 'hevc':
+            # We never encode through this context (packets are muxed as-is),
+            # but PyAV still opens it — keep libx265's banner out of the logs
+            stream.codec_context.options = {'x265-params': 'log-level=none'}
+        time_base = Fraction(1, 90000)
+        base_ts = packet_list[0]['ts']
+        last_pts = -1
+        for p in packet_list:
+            pkt = av.Packet(p['data'])
+            pts = int(round((p['ts'] - base_ts) * 90000))
+            if pts <= last_pts:  # guard against duplicate/rounded-equal timestamps
+                pts = last_pts + 1
+            last_pts = pts
+            pkt.pts = pts
+            pkt.dts = pts
+            pkt.time_base = time_base
+            pkt.stream = stream
+            container.mux(pkt)
+        # Sentinel: re-mux the last packet 1s past the end. The fps filter only
+        # emits a grid slot once it sees a frame beyond it, so without this the
+        # final tick can go unemitted when the last real frame lands just
+        # before it. The sentinel's own (re-decoded) picture is never output —
+        # it lies beyond the -frames:v cap.
+        sentinel = av.Packet(packet_list[-1]['data'])
+        sentinel.pts = sentinel.dts = last_pts + 90000
+        sentinel.time_base = time_base
+        sentinel.stream = stream
+        container.mux(sentinel)
+        container.close()
+        return ts_path
+
+    def encode_episode(
+        self, episode_index: int, dataset_meta,
+        first_tick_time: float, episode_length: int, gpu_index: int = 0,
+        camera_resolutions: dict = None, tick_indices: list = None,
+    ) -> dict:
+        """
+        Encode all buffered cameras to all-IDR MP4s, one concurrent ffmpeg each,
+        then sample stats frames from the encoded videos (still on the worker).
+
+        Args:
+            episode_index: Index of the episode (determines output paths)
+            dataset_meta: Dataset metadata object with get_video_file_path()
+            first_tick_time: Bag time of the first state tick (start_time + 1/fps);
+                video frame 0 is aligned to this instant
+            episode_length: Number of data frames; output videos are capped to
+                exactly this many frames
+            gpu_index: Which GPU to run decode+encode on
+            camera_resolutions: {camera_name: (height, width, channels)} for
+                the stats sampler
+            tick_indices: Tick index of each data row when mid-episode ticks
+                were dropped (row j keeps grid slot tick_indices[j]); None
+                means no drops — rows map to contiguous grid slots 0..N-1
+
+        Returns:
+            {video_key: sampled_frames ndarray} for successfully sampled cameras
+        """
+        _t_ep = time.perf_counter()
+        jobs = []
+        for camera_name, packet_list in self.packets.items():
+            if len(packet_list) == 0:
+                continue
+            video_key = f"observation.images.{camera_name}"
+            video_path = self.root_dir / dataset_meta.get_video_file_path(
+                episode_index, video_key
+            )
+            video_path.parent.mkdir(parents=True, exist_ok=True)
+            # Encode to <name>.mp4.tmp and rename at save time: LeRobot's
+            # save_episode asserts the number of *.mp4 files on disk matches
+            # the number of saved episodes, and later episodes may finish
+            # encoding before earlier ones are saved.
+            tmp_path = video_path.parent / (video_path.name + ".tmp")
+            jobs.append((camera_name, packet_list, tmp_path))
+
+        with ThreadPoolExecutor(max_workers=max(1, len(jobs))) as cam_pool:
+            futures = [
+                cam_pool.submit(
+                    self._encode_camera, camera_name, packet_list, tmp_path,
+                    first_tick_time, episode_length, gpu_index, tick_indices,
+                )
+                for camera_name, packet_list, tmp_path in jobs
+            ]
+            for future in futures:
+                future.result()  # propagate camera encode failures (fatal)
+
+        _t_sample = time.perf_counter()
+        sampled = {}
+        for camera_name, _packet_list, tmp_path in jobs:
+            video_key = f"observation.images.{camera_name}"
+            if not tmp_path.exists():
+                continue
+            try:
+                height, width, _ = camera_resolutions[camera_name]
+                sampled[video_key] = sample_frames_from_video(
+                    video_path=tmp_path,
+                    episode_length=episode_length,
+                    fps=self.fps,
+                    width=width,
+                    height=height,
+                )
+            except Exception as e:
+                logging.error(
+                    f"Failed to sample frames from {camera_name}: {e}\n"
+                    f"Traceback (most recent call last):\n{traceback.format_exc()}"
+                )
+
+        logging.info(
+            f"  [PERF encode ep{episode_index} gpu{gpu_index}] "
+            f"{len(jobs)} cams, {episode_length} frames each: "
+            f"{time.perf_counter() - _t_ep:.2f}s "
+            f"(sample: {time.perf_counter() - _t_sample:.2f}s)"
+        )
+        self.clear()
+        return sampled
+
+    def _encode_camera(
+        self, camera_name, packet_list, tmp_path,
+        first_tick_time, episode_length, gpu_index, tick_indices=None,
+    ) -> None:
+        """Mux one camera's packets and run its GPU (or fallback CPU) encode."""
+        info = self.video_info[camera_name]
+        ts_path = self._mux_to_ts(packet_list, info)
+
+        # Grid origin so that output frame k = the LATEST source frame at or
+        # before (first state tick + k/fps). round=up gives this floor
+        # semantics — identical to the old GOP=1 pipeline, which grabbed the
+        # most recent packet on hand at each capture tick (and causally
+        # correct: at time T the policy can only have seen frames <= T).
+        # Packets are buffered from the last IDR before the X press, so the
+        # stream starts earlier than the tick; the fps filter drops the
+        # decoded-but-pre-tick frames. (fps/setpts are timestamp-only
+        # filters: they pass CUDA hw frames through untouched, so the
+        # pipeline stays fully on the GPU.)
+        grid_start = max(first_tick_time - packet_list[0]['ts'], 0.0)
+
+        # Raw packets are fully persisted in the temp .ts now — release them
+        # so in-flight episodes don't hold whole episodes of HEVC in RAM
+        packet_list.clear()
+        resample_vf = (
+            f"fps={self.fps}:start_time={grid_start:.6f}:round=up,"
+            f"setpts=PTS-STARTPTS"
+        )
+        # Resizing happens after resampling, on the GPU when the GPU path
+        # runs (decoded frames never leave it) and in software otherwise.
+        # Not lanczos/bicubic on the GPU: scale_cuda does not clamp their
+        # overshoot, so near-black pixels wrap to white (salt noise in dark
+        # areas). Bilinear on the GPU and area in software both average each
+        # 2x2 block for the 3840x1920 -> 1920x960 case, so the two paths
+        # give the same picture.
+        size = self.output_sizes.get(camera_name)
+        gpu_vf = resample_vf
+        cpu_vf = resample_vf
+        vaapi_vf = resample_vf
+        if size is not None:
+            width, height = size
+            gpu_vf += f",scale_cuda={width}:{height}:interp_algo=bilinear"
+            cpu_vf += f",scale={width}:{height}:flags=area"
+            # Keep the resize on the GPU: a CPU-side scale would convert the
+            # full-range source to limited range (washed-out levels).
+            vaapi_vf += f",scale_vaapi=w={width}:h={height}:format=nv12"
+        else:
+            vaapi_vf += ",scale_vaapi=format=nv12"
+        # With dropped ticks the encode must cover the full tick span so
+        # _finalize_video can pick each row's own slot from the grid.
+        grid_span = (tick_indices[-1] + 1) if tick_indices else episode_length
+
+        backend, devices = _get_video_backend()
+        # Ask for one extra frame: ffmpeg 7.x + NVENC can drop the frame that
+        # hits the -frames:v cap during teardown, so the capped frame must be
+        # a sacrificial one past the episode's last tick. _finalize_video
+        # trims the output back to episode_length.
+        frame_cap = str(grid_span + 1)
+
+        if backend == "nvidia":
+            gpu_cmd = [
+                "ffmpeg", "-y", "-v", "error",
+                "-hwaccel", "cuda",
+                "-hwaccel_device", str(gpu_index),
+                "-hwaccel_output_format", "cuda",   # keep decoded frames on the GPU
+                "-c:v", "hevc_cuvid",
+                "-i", ts_path,
+                "-vf", gpu_vf,
+                "-frames:v", frame_cap,
+                "-c:v", "hevc_nvenc",
+                "-gpu", str(gpu_index),
+                "-g", "1",
+                "-forced-idr", "1",
+                "-strict_gop", "1",
+                "-preset", "p1",
+                # -qp (constant quantizer) instead of -rc vbr -cq: every frame
+                # gets the identical quantizer, so no brightness/quality
+                # variation between consecutive IDR frames.
+                "-qp", str(self.crf),
+                "-color_range", "pc",       # full range (original is yuvj420p)
+                "-f", "mp4",
+                str(tmp_path),
+            ]
+        elif backend == "vaapi":
+            # Decode and encode both run on the render node; fps/setpts pass
+            # VA-API surfaces through untouched.
+            va_device = devices[gpu_index % len(devices)]
+            # Constant-quantizer quality offset; see _VAAPI_QP_OFFSET.
+            qp = max(0, min(51, self.crf - _VAAPI_QP_OFFSET))
+            gpu_cmd = [
+                "ffmpeg", "-y", "-v", "error",
+                "-init_hw_device", f"vaapi=va:{va_device}",
+                "-hwaccel", "vaapi",
+                "-hwaccel_device", "va",
+                "-hwaccel_output_format", "vaapi",
+                "-c:v", info["codec"],
+                "-i", ts_path,
+                "-vf", vaapi_vf,
+                "-frames:v", frame_cap,
+                "-c:v", "hevc_vaapi",
+                "-rc_mode", "CQP",
+                "-qp", str(qp),
+                "-g", "1",          # every frame an IDR (random access)
+                "-bf", "0",         # no B-frames, like the NVENC path
+                "-color_range", "pc",   # full range (original is yuvj420p)
+                "-f", "mp4",
+                str(tmp_path),
+            ]
+        else:
+            gpu_cmd = None
+
+        try:
+            if gpu_cmd is None:
+                self._encode_cpu(ts_path, tmp_path, cpu_vf, grid_span)
+            else:
+                with _ENCODE_SESSIONS:
+                    result = subprocess.run(gpu_cmd, capture_output=True, text=True)
+                if result.returncode != 0 or not tmp_path.exists():
+                    gpu_err = result.stderr.strip()[:300] if result.stderr else "unknown"
+                    logging.warning(
+                        f"  {backend} pipeline failed for {camera_name} ({gpu_err}), "
+                        f"falling back to CPU..."
+                    )
+                    self._encode_cpu(ts_path, tmp_path, cpu_vf, grid_span)
+        finally:
+            if os.path.exists(ts_path):
+                os.unlink(ts_path)
+
+        self._finalize_video(tmp_path, camera_name, episode_length, tick_indices)
+
+    def _finalize_video(self, tmp_path, camera_name, episode_length,
+                        tick_indices=None) -> None:
+        """Rebuild the container so it holds exactly episode_length frames.
+
+        The encode requests episode_length+1 frames, so depending on the
+        ffmpeg version and tick phase the file arrives with N-1..N+1 real
+        packets — and ffmpeg 7.x's muxer writes nb_frames/duration from the
+        request, not from what it actually wrote, so the metadata cannot be
+        trusted (torchcodec then walks past EOF sampling the last frame).
+        A pure remux (no re-encode) keeps episode_length packets with
+        explicit uniform durations on a 90kHz timescale — the first
+        episode_length grid slots, or the rows' own slots when tick_indices
+        marks mid-episode drops; if the file is short, the final IDR packet
+        is cloned — all-IDR output makes the clone an exact picture
+        duplicate.
+        """
+        keep = set(tick_indices) if tick_indices else None
+        fixed_path = tmp_path.parent / (tmp_path.name + ".fix")
+        src = av.open(str(tmp_path))
+        dst = av.open(str(fixed_path), "w", format="mp4",
+                      options={"video_track_timescale": "90000"})
+        in_stream = src.streams.video[0]
+        out_stream = dst.add_stream_from_template(in_stream)
+        if in_stream.codec_context.name == 'hevc':
+            # A remux, but PyAV opens libx265 for this stream too (see _mux_to_ts)
+            out_stream.codec_context.options = {'x265-params': 'log-level=none'}
+        tb = Fraction(1, 90000)
+        step = int(round(90000 / self.fps))
+        grid_pos = 0
+        written = 0
+        last_data = None
+        for pkt in src.demux(in_stream):
+            if pkt.dts is None:
+                continue
+            if written >= episode_length:
+                break
+            if keep is not None and grid_pos not in keep:
+                grid_pos += 1
+                continue
+            grid_pos += 1
+            last_data = bytes(pkt)
+            pkt.pts = pkt.dts = written * step
+            pkt.duration = step
+            pkt.time_base = tb
+            pkt.stream = out_stream
+            dst.mux(pkt)
+            written += 1
+        missing = episode_length - written
+        if missing > 5:
+            logging.warning(
+                f"  {camera_name}: video is {missing} frames short of "
+                f"{episode_length} — camera dropout? Padding anyway."
+            )
+        for i in range(written, episode_length):
+            pad = av.Packet(last_data)
+            pad.pts = pad.dts = i * step
+            pad.duration = step
+            pad.time_base = tb
+            pad.stream = out_stream
+            pad.is_keyframe = True
+            dst.mux(pad)
+        dst.close()
+        src.close()
+        os.replace(fixed_path, tmp_path)
+        if missing > 0:
+            logging.info(f"  {camera_name}: padded {missing} tail frame(s) by cloning the last IDR packet")
+
+    def _encode_cpu(self, ts_path, tmp_path, resample_vf, episode_length) -> None:
+        """CPU fallback: software decode + libx265 all-IDR encode (same alignment)."""
+        cpu_cmd = [
+            "ffmpeg", "-y", "-v", "error",
+            "-i", ts_path,
+            "-vf", resample_vf,
+            "-frames:v", str(episode_length + 1),
+            "-c:v", "libx265",
+            "-x265-params", "keyint=1:min-keyint=1:open-gop=0:log-level=error",
+            "-preset", self.preset,
+            "-crf", str(self.crf),
+            "-pix_fmt", "yuv420p",
+            "-color_range", "pc",       # full range (original is yuvj420p)
+            "-f", "mp4",
+            str(tmp_path),
+        ]
+        result = subprocess.run(cpu_cmd, capture_output=True, text=True)
+        if result.returncode != 0 or not tmp_path.exists():
+            raise IOError(f"CPU encode failed: {result.stderr.strip()[:500]}")
+        logging.info(f"  CPU complete: {tmp_path}")
+
+    def clear(self) -> None:
+        """Clear all buffered packets."""
+        self.packets.clear()
+        self.video_info.clear()
+
+
+# =============================================================================
+# Main converter class
+# =============================================================================
 
 class MultiVideoRosBag2LeRobotConverter:
     """Enhanced converter for multiple ROS2 bags to single LeRobot dataset with multiple episodes."""
 
-    def __init__(self, input_directory: str, output_repo_id: str, fps: int = 30):
+    def __init__(self, input_directory: str, output_repo_id: str, fps: int = 45, crf: int = 23,
+                 output_sizes: dict = None):
         self.input_directory = Path(input_directory)
+        # {camera_key: (width, height)} for cameras resized while encoding
+        self.output_sizes = dict(output_sizes or {})
         self.output_repo_id = output_repo_id
         self.fps = fps
+        self.crf = crf
+        self.max_episodes = None
         self.frame_duration = 1.0 / self.fps
 
         if not logging.getLogger().handlers:
             logging.basicConfig(level=logging.INFO)
         self.logger = logging.getLogger(__name__)
 
-        # Video topics mapping
+        # Video topics mapping - all 7 cameras from your robot
         self.video_topics = {
             'left_color':  '/left/color/image_raw/ffmpeg',
             'right_color': '/right/color/image_raw/ffmpeg',
             'head_camera': '/xr_video_topic/ffmpeg',
+            # 'chest_camera':'/head/color/image_raw/ffmpeg',
         }
         # Video topics set
         self.video_topics_set = set(self.video_topics.values())
@@ -111,11 +771,15 @@ class MultiVideoRosBag2LeRobotConverter:
         self.state_topics_set = {
             '/left_arm/joint_states', '/left_arm/current_ee_pose', '/left_gripper/joint_states',
             '/right_arm/joint_states','/right_arm/current_ee_pose','/right_gripper/joint_states',
+            '/chassis/joint_states', '/kinco/actual_velocity',
+            '/kinco/actual_position',
         }
         # Action topics set
         self.action_topics_set = {
-            '/left_arm/joint_cmd', '/left_arm/target_ee_pose', '/left_gripper/joint_cmd',
-            '/right_arm/joint_cmd','/right_arm/target_ee_pose','/right_gripper/joint_cmd',
+            '/left_arm/joint_cmd', '/left_target_ee_pose', '/left_gripper/joint_cmd',
+            '/right_arm/joint_cmd','/right_target_ee_pose','/right_gripper/joint_cmd',
+            '/chassis/joint_cmd', '/kinco/cmd_velocity',
+            '/chassis_target_vel',
         }
         # All topics set
         self.all_topics_set = self.video_topics_set | self.state_topics_set | self.action_topics_set
@@ -132,6 +796,58 @@ class MultiVideoRosBag2LeRobotConverter:
         # action tracking
         self._cur_action_msg = np.zeros(STATE_ACTION_DIM, dtype=np.float32)
 
+        # Reverse topic -> camera_key map (avoids a linear scan per message)
+        self.topic_to_camera = {topic: cam for cam, topic in self.video_topics.items()}
+        # Reusable all-zero placeholder frames, one per camera resolution
+        self._black_frame_cache = {}
+
+        # Lazy state/action deserialization: raw CDR bytes are cached per
+        # topic and only the latest message per topic is deserialized when a
+        # frame is actually captured (identical result, ~10x fewer deserializes)
+        self._dirty_state = {}
+        self._dirty_action = {}
+
+        # --- Encode pipeline: episodes encode on GPU in the background while
+        # --- the main thread keeps reading the bag. Two workers per GPU
+        # --- (one episode's 3-camera encode doesn't saturate a 4090).
+        self.video_backend, self.encode_devices = _get_video_backend()
+        if self.video_backend == "cpu":
+            self.n_gpus = 0
+            self.logger.info(
+                "Video backend: CPU (libx265; no NVIDIA GPU or VA-API HEVC encoder)"
+            )
+        else:
+            self.n_gpus = max(1, len(self.encode_devices))
+            if self.video_backend == "nvidia":
+                self.logger.info(
+                    f"Video backend: NVIDIA NVENC ({self.n_gpus} GPU(s), "
+                    f"CUDA indices {self.encode_devices})"
+                )
+            else:
+                self.logger.info(
+                    f"Video backend: VA-API ({', '.join(self.encode_devices)})"
+                )
+        self._encode_workers = 2 * max(1, self.n_gpus)
+        self._encode_pool = ThreadPoolExecutor(
+            max_workers=self._encode_workers, thread_name_prefix="ep-encode"
+        )
+        self._pending = deque()   # episodes submitted for encode, FIFO
+        self._episode_seq = 0     # round-robin GPU assignment
+        self._episode_ticks = []  # tick index of each added row (holes = dropped ticks)
+        self.max_pending = 2 * self._encode_workers
+
+
+    @staticmethod
+    def _find_bag_files(directory):
+        """Find .db3 or .mcap bag files in a directory, skipping macOS
+        AppleDouble sidecar files (e.g. '._rec_xxx.mcap') that would
+        otherwise be globbed alongside the real recording and cause it
+        to be processed twice."""
+        directory = Path(directory)
+        db3_files = [f for f in directory.glob("*.db3") if not f.name.startswith("._")]
+        if db3_files:
+            return db3_files
+        return [f for f in directory.glob("*.mcap") if not f.name.startswith("._")]
 
     def discover_rosbags(self, MULTIBAG_FLAG, verbose: bool = False):
         """Discover all ROS2 bags in the input directory."""
@@ -142,19 +858,19 @@ class MultiVideoRosBag2LeRobotConverter:
             rosbag_folders = []
             root_path = self.input_directory
             root = Path(root_path).resolve()
-            
+
             if not root.exists():
                 raise ValueError(f"Path does not exist: {root_path}")
-            
+
             if not root.is_dir():
                 raise ValueError(f"Path is not a directory: {root_path}")
-            
+
             folder_count = 0
-            
+
             for dirpath, dirnames, filenames in os.walk(root):
                 current_dir = Path(dirpath)
                 folder_count += 1
-                
+
                 file_extensions = {Path(f).suffix.lower() for f in filenames}
                 has_bag = '.db3' in file_extensions or '.mcap' in file_extensions
                 has_yaml = '.yaml' in file_extensions or '.yml' in file_extensions
@@ -164,40 +880,26 @@ class MultiVideoRosBag2LeRobotConverter:
                     dirnames.clear()
 
             if rosbag_folders:
-                # One entry per bag directory: the reader opens the directory and
-                # replays every storage file listed in metadata.yaml, so split bags
-                # (multiple .db3/.mcap segments) must not be enumerated per file
-                for rosbag_dir in sorted(rosbag_folders):
+                # Find .db3 or .mcap files in rosbag directory
+                for rosbag_dir in rosbag_folders:
                     rosbag_dir = Path(rosbag_dir)
-                    db3_files = sorted(rosbag_dir.glob("*.db3"))
-                    mcap_files = sorted(rosbag_dir.glob("*.mcap"))
-                    if db3_files and mcap_files:
-                        self.logger.warning(
-                            f"{rosbag_dir} contains both .db3 and .mcap files; "
-                            f"using .db3 and ignoring .mcap")
-                    db3_files = db3_files or mcap_files
+                    db3_files = self._find_bag_files(rosbag_dir)
                     if db3_files:
-                        rosbags.append({
-                            'name': rosbag_dir.name,
-                            'path': str(rosbag_dir),
-                            'bag_file': str(db3_files[0]),
-                        })
+                        for db3_file in db3_files:
+                            rosbags.append({
+                                'name': rosbag_dir.name,
+                                'path': str(rosbag_dir),
+                                'bag_file': str(db3_file),
+                            })
 
         else:
-            # one rosbag: the directory holds a single bag (one metadata.yaml),
-            # possibly split into several storage files
-            db3_files = sorted(self.input_directory.glob("*.db3"))
-            mcap_files = sorted(self.input_directory.glob("*.mcap"))
-            if db3_files and mcap_files:
-                self.logger.warning(
-                    f"{self.input_directory} contains both .db3 and .mcap files; "
-                    f"using .db3 and ignoring .mcap")
-            db3_files = db3_files or mcap_files
-            if db3_files:
+            # one rosbag
+            db3_files = self._find_bag_files(self.input_directory)
+            for i, db3_file in enumerate(sorted(db3_files)):
                 rosbags.append({
-                    'name': "episode_000",
-                    'path': str(db3_files[0].parent),
-                    'bag_file': str(db3_files[0])
+                    'name': f"episode_{i:03d}",
+                    'path': str(db3_file.parent),
+                    'bag_file': str(db3_file)
                 })
 
         self.logger.info(f"Discovered {len(rosbags)} bags:")
@@ -207,18 +909,25 @@ class MultiVideoRosBag2LeRobotConverter:
         return rosbags
 
     def get_camera_resolution(self, camera_key):
-        """Get camera resolution - different cameras may have different resolutions."""
+        """(height, width, channels) of the camera's output video.
+
+        This is the size written into the dataset features and used for the
+        stats sampler, so it is the resized size when the camera is resized.
+        """
+        if camera_key in self.output_sizes:
+            width, height = self.output_sizes[camera_key]
+            return (height, width, 3)
         if camera_key == 'head_camera':
             # Head camera is higher resolution
-            return (2160, 4320, 3) 
+            return (1920, 3840, 3)
         else:
-            return (480, 848, 3)  # Stereo cameras
+            return (800, 2560, 3)  # Stereo cameras
 
     def setup_features(self):
-        """Setup LeRobot dataset features with 48-dim data + video features."""
+        """Setup LeRobot dataset features with STATE_ACTION_DIM state/action dims + video features."""
         features = {}
 
-        # Complete 48-dimensional feature names
+        # Complete STATE_ACTION_DIM-dimensional feature names
         feature_names = [
             # Joint positions (16)
             "left_joint1_position", "left_joint2_position", "left_joint3_position", "left_joint4_position",
@@ -240,6 +949,20 @@ class MultiVideoRosBag2LeRobotConverter:
             "left_ee_orientation_x", "left_ee_orientation_y", "left_ee_orientation_z","left_ee_orientation_w",
             "right_ee_position_x", "right_ee_position_y", "right_ee_position_z",
             "right_ee_orientation_x", "right_ee_orientation_y", "right_ee_orientation_z","right_ee_orientation_w",
+            # Chassis + Kinco (10 dims, neutral names — same layout in state & action)
+            "chassis_motor1_position", "chassis_motor2_position", "chassis_motor3_position",
+            "chassis_motor1_velocity", "chassis_motor2_velocity", "chassis_motor3_velocity",
+            "chassis_motor1_effort", "chassis_motor2_effort", "chassis_motor3_effort",
+            "kinco_velocity",
+            # Unpaired (4 dims). Each is written by one side only; the other
+            # side keeps the 0 it was initialised with.
+            # state only — /kinco/actual_position (Float64, lift height).
+            # Kept next to kinco_velocity so the lift's two dims read together.
+            "kinco_position",
+            # action only — /chassis_target_vel (Float32MultiArray).
+            # Components are taken to be vx / vy / yaw-rate; if that reading is
+            # wrong only these names need fixing, not the stored values.
+            "chassis_target_vel_x", "chassis_target_vel_y", "chassis_target_vel_yaw",
         ]
 
         # ACTION features
@@ -282,13 +1005,6 @@ class MultiVideoRosBag2LeRobotConverter:
             )
             self.logger.info(f"Created LeRobot dataset: {self.output_repo_id}")
 
-    def _get_camera_key_from_topic(self, topic):
-        """Map ROS topic to camera key."""
-        for camera_key, camera_topic in self.video_topics.items():
-            if topic == camera_topic:
-                return camera_key
-        return None
-
     def extract_joint_data(self, msg:JointState):
         """Extract joint state data."""
         positions = list(msg.position) if msg.position else []
@@ -315,9 +1031,22 @@ class MultiVideoRosBag2LeRobotConverter:
     def extract_ee_pose_data(self, msg:Pose):
         """Extract end-effector pose data (position + orientation)."""
         return np.array([
-            msg.position.x, msg.position.y, msg.position.z, 
+            msg.position.x, msg.position.y, msg.position.z,
             msg.orientation.x, msg.orientation.y, msg.orientation.z, msg.orientation.w
         ], dtype=np.float32)
+
+    def extract_multiarray_data(self, msg, size: int):
+        """First `size` entries of a Float*MultiArray, zero-padded.
+
+        The publisher decides the array length; clamping and padding here keeps
+        a short or over-long message from shifting neighbouring dimensions.
+        """
+        values = list(msg.data) if msg.data is not None else []
+        out = np.zeros(size, dtype=np.float32)
+        n = min(len(values), size)
+        if n:
+            out[:n] = values[:n]
+        return out
 
     def _update_state_msg(self, topicName:str, msg:JointState):
         if   topicName == '/left_arm/joint_states':
@@ -352,7 +1081,19 @@ class MultiVideoRosBag2LeRobotConverter:
             ee_pose_data = self.extract_ee_pose_data(msg)
             self._cur_state_msg[55:62] = ee_pose_data
 
-    def _update_action_msg(self, topicName:str, msg:JointState):
+        # --- Chassis + Kinco (indices 62-71, +10 dims) ---
+        elif topicName == '/chassis/joint_states':
+            jd = self.extract_joint_data(msg)  # 3 motors × 3 = 9 values
+            self._cur_state_msg[62:71] = jd[0:9]   # pos[0:3], vel[3:6], eff[6:9]
+        elif topicName == '/kinco/actual_velocity':
+            self._cur_state_msg[71] = msg.data     # Float64
+
+        # --- Unpaired: lift height feedback, no action counterpart (index 72) ---
+        # Robots without a lift never publish this, so the dim stays 0.
+        elif topicName == '/kinco/actual_position':
+            self._cur_state_msg[72] = msg.data     # Float64
+
+    def _update_action_msg(self, topicName:str, msg):
         if   topicName == '/left_arm/joint_cmd':
             joint_data = self.extract_joint_data(msg)
             self._cur_action_msg[0:7] = joint_data[0:7]
@@ -377,64 +1118,85 @@ class MultiVideoRosBag2LeRobotConverter:
             self._cur_action_msg[31] = gripper_data[1]
             self._cur_action_msg[47] = gripper_data[2]
 
-        elif topicName == '/left_arm/target_ee_pose':
+        elif topicName == '/left_target_ee_pose':
             ee_pose_data = self.extract_ee_pose_data(msg)
             self._cur_action_msg[48:55] = ee_pose_data
 
-        elif topicName == '/right_arm/target_ee_pose':
+        elif topicName == '/right_target_ee_pose':
             ee_pose_data = self.extract_ee_pose_data(msg)
             self._cur_action_msg[55:62] = ee_pose_data
 
+        # --- Chassis + Kinco (indices 62-71, +10 dims) ---
+        elif topicName == '/chassis/joint_cmd':
+            jd = self.extract_joint_data(msg)  # 3 motors × 3 = 9 values
+            self._cur_action_msg[62:71] = jd[0:9]  # pos[0:3], vel[3:6], eff[6:9]
+        elif topicName == '/kinco/cmd_velocity':
+            self._cur_action_msg[71] = msg.data    # Float64
+
+        # --- Unpaired: chassis velocity command, no state counterpart (73-75) ---
+        elif topicName == '/chassis_target_vel':
+            self._cur_action_msg[73:76] = self.extract_multiarray_data(msg, 3)
+
     def _update_video_frame(self, topicName:str, msg:FFMPEGPacket):
-        camera_key = self._get_camera_key_from_topic(topicName)
+        camera_key = self.topic_to_camera.get(topicName)
         if camera_key:
-            height, width, _ = self.get_camera_resolution(camera_key)
+            # Use actual resolution from the FFMPEGPacket message instead of
+            # hardcoded values. This ensures the video encoding parameters
+            # match the actual bitstream dimensions.
             self._cur_video_packet[camera_key] = {
                 'data': bytes(msg.data),
                 'pts': msg.pts,
-                'width': width,
-                'height': height,
+                'width': msg.width,
+                'height': msg.height,
                 'encoding': msg.encoding,
             }
-        
+
     def update_messages(self, topicName, data):
-        """Use a single interface to update state, video_frame, and action"""
-        msg_type = self.topic_types_dict.get(topicName)
-        if not msg_type:
-            pass
-        else:
-            msg_class = get_message(msg_type)
-            msg = deserialize_message(data, msg_class)
+        """Use a single interface to update state, video_frame, and action.
 
-            if topicName in self.state_topics_set:
-                self._update_state_msg(topicName, msg)
+        Video packets are deserialized eagerly (they must be buffered
+        continuously); state/action messages just cache their raw bytes —
+        only the latest message per topic matters, so deserialization is
+        deferred to the 30Hz capture ticks (see _materialize_state/_action).
+        """
+        if topicName in self.video_topics_set:
+            msg_class = self.topic_msg_class.get(topicName)
+            if msg_class is not None:
+                self._update_video_frame(topicName, deserialize_message(data, msg_class))
 
-            elif topicName in self.action_topics_set:
-                self._update_action_msg(topicName, msg)
-            
-            elif topicName in self.video_topics_set:
-                self._update_video_frame(topicName, msg)
-    
-    def add_state_and_video_packet(self, frame_data:dict, packet_buffer:VideoPacketBuffer):
-        """Create a frame with state data and video at the specified time."""
-        frame_data["observation.state"] = self._cur_state_msg.copy()
+        elif topicName in self.state_topics_set:
+            if topicName in self.topic_msg_class:
+                self._dirty_state[topicName] = data
 
-        for camera_key in self.video_topics.keys():
+        elif topicName in self.action_topics_set:
+            if topicName in self.topic_msg_class:
+                self._dirty_action[topicName] = data
+
+    def _materialize_state(self):
+        """Apply the latest cached raw message of each state topic."""
+        if self._dirty_state:
+            for topic, raw in self._dirty_state.items():
+                self._update_state_msg(topic, deserialize_message(raw, self.topic_msg_class[topic]))
+            self._dirty_state.clear()
+
+    def _materialize_action(self):
+        """Apply the latest cached raw message of each action topic."""
+        if self._dirty_action:
+            for topic, raw in self._dirty_action.items():
+                self._update_action_msg(topic, deserialize_message(raw, self.topic_msg_class[topic]))
+            self._dirty_action.clear()
+
+    def _get_black_frame(self, camera_key):
+        """Reusable zero placeholder frame (add_frame only records the shape)."""
+        black = self._black_frame_cache.get(camera_key)
+        if black is None:
             height, width, channels = self.get_camera_resolution(camera_key)
-            black_frame = np.zeros((height, width, channels), dtype=np.uint8)
-            frame_data[f"observation.images.{camera_key}"] = black_frame
-
-        for camera_key, packet in self._cur_video_packet.items():
-            if packet is not None:
-                packet_buffer.add_packet(
-                    camera_name=camera_key,
-                    packet_data=packet['data'],
-                    width=packet['width'],
-                    height=packet['height'],
-                    codec=packet['encoding'],
-                )
+            black = np.zeros((height, width, channels), dtype=np.uint8)
+            self._black_frame_cache[camera_key] = black
+        return black
 
     def add_action(self, frame_data:dict):
+        self._materialize_action()
         frame_data['action'] = self._cur_action_msg.copy()
 
     def realign_timestamps(self):
@@ -451,24 +1213,246 @@ class MultiVideoRosBag2LeRobotConverter:
         self.logger.info(f"⏹️ Realigned timestamps for {episode_length} frames, timestamp range: {aligned_timestamps[0]:.6f} to {aligned_timestamps[-1]:.6f} seconds")
 
 
-    def convert_single_bag(self, rosbag, task_description: str, ENFORCE_ALL_VIDEO_TOPICS_FLAG: bool):
+    def _start_episode_capture(self, recent_packets, start_time):
+        """Begin capturing an episode at an X press.
+
+        Creates a fresh episode buffer + packet buffer and pre-fills the
+        packet buffer from the sliding window, starting at each camera's last
+        IDR before the X press so ffmpeg can decode the complete GOP.
+        """
+        self.dataset.episode_buffer = self.dataset.create_episode_buffer()
+        self._episode_ticks = []
+        packet_buffer = AllIdrVideoBuffer(
+            root_dir=self.dataset.root, fps=self.dataset.fps, crf=self.crf,
+            output_sizes=self.output_sizes,
+        )
+        _t = time.perf_counter()
+        for ck in self.video_topics.keys():
+            window = recent_packets[ck]
+            # Find the last IDR in the window
+            idr_idx = -1
+            for i in range(len(window) - 1, -1, -1):
+                if _has_idr(window[i]['data']):
+                    idr_idx = i
+                    break
+            if idr_idx >= 0:
+                for p in list(window)[idr_idx:]:
+                    packet_buffer.add_packet(
+                        camera_name=ck,
+                        packet_data=p['data'],
+                        width=p['width'],
+                        height=p['height'],
+                        codec=p['encoding'],
+                        ts=p['ts'],
+                    )
+                self.logger.info(
+                    f"  📹 {ck}: buffered {len(window) - idr_idx} pkts "
+                    f"from IDR at {window[idr_idx]['ts']:.3f}s (X at {start_time:.3f}s)"
+                )
+        self._perf['idr_window_flush'] += time.perf_counter() - _t
+        return packet_buffer
+
+    def _submit_episode(self, packet_buffer, start_time, end_time, task_description):
+        """Hand the finished episode to a background GPU-encode worker.
+
+        The episode buffer is detached from the dataset and queued together
+        with the encode future; `_drain_pending` later runs the (cheap) frame
+        sampling + parquet save on the main thread, strictly in FIFO order so
+        episode indices stay consistent.
+        """
+        duration = end_time - start_time
+        self.logger.info(f"⏹️ Stop TimeRange: {start_time:.3f} to {end_time:.3f} seconds. Duration: {duration:.3f} seconds")
+
+        self.num_xy_pairs += 1
+
+        data_ep_len = self.dataset.episode_buffer["size"] if self.dataset.episode_buffer else 0
+
+        if data_ep_len < MIN_EPISODE_LENGTH:
+            self.dataset.clear_episode_buffer()
+            packet_buffer.clear()
+            self.logger.warning(f"  ⚠️ Episode too short, discarded")
+            return
+
+        self.realign_timestamps()
+
+        # Row j's video frame must show row j's tick, so when mid-episode
+        # ticks were dropped the video grid has to skip the same slots the
+        # data rows skipped (row timestamps are realigned to a contiguous
+        # i/fps grid above, so any extra video slot would shift every later
+        # row onto an earlier frame). Identity (no drops) passes None.
+        tick_indices = self._episode_ticks
+        if len(tick_indices) != data_ep_len:
+            self.logger.error(
+                f"  tick tracker out of sync ({len(tick_indices)} ticks vs "
+                f"{data_ep_len} rows) — falling back to contiguous frames"
+            )
+            tick_indices = None
+        elif tick_indices[-1] == data_ep_len - 1:
+            tick_indices = None  # no dropped ticks — contiguous grid
+        self._episode_ticks = []
+
+        # Detach the buffer: the main loop will create a fresh one at the next
+        # X press, and _stage2_save reattaches this one when its encode is done.
+        episode_buffer = self.dataset.episode_buffer
+        self.dataset.episode_buffer = None
+
+        # Video index must be pre-assigned: earlier episodes may still be
+        # encoding, so dataset.num_episodes hasn't caught up yet.
+        video_episode_index = self.dataset.num_episodes + len(self._pending)
+        gpu_index = self._episode_seq % max(1, self.n_gpus)
+        self._episode_seq += 1
+
+        # Output video frame 0 is aligned to the first state tick.
+        first_tick_time = start_time + self.frame_duration
+
+        camera_resolutions = {
+            cam: self.get_camera_resolution(cam) for cam in self.video_topics.keys()
+        }
+        future = self._encode_pool.submit(
+            packet_buffer.encode_episode,
+            episode_index=video_episode_index,
+            dataset_meta=self.dataset.meta,
+            first_tick_time=first_tick_time,
+            episode_length=data_ep_len,
+            gpu_index=gpu_index,
+            camera_resolutions=camera_resolutions,
+            tick_indices=tick_indices,
+        )
+        self._pending.append({
+            'future': future,
+            'buffer': episode_buffer,
+            'episode_index': video_episode_index,
+            'episode_length': data_ep_len,
+            'video_duration': duration,
+        })
+
+    def _drain_pending(self, block: bool = False):
+        """Save episodes whose encode has finished (FIFO).
+
+        With block=False only completed heads are saved, unless the queue
+        exceeds max_pending — then we wait on the oldest for backpressure.
+        With block=True everything is drained (end of bag / max_episodes).
+        """
+        while self._pending:
+            head = self._pending[0]
+            must_wait = block or len(self._pending) > self.max_pending
+            if not must_wait and not head['future'].done():
+                break
+            _t = time.perf_counter()
+            # re-raises worker errors: encode failure is fatal
+            head['sampled'] = head['future'].result()
+            self._perf['encode_stall'] += time.perf_counter() - _t
+            self._pending.popleft()
+            self._stage2_save(head)
+
+    def _stage2_save(self, item):
+        """Sample stats frames from the encoded videos and save the episode."""
+        episode_buffer = item['buffer']
+        episode_index = item['episode_index']
+        episode_length = item['episode_length']
+
+        assert self.dataset.num_episodes == episode_index, (
+            f"Episode index mismatch: dataset has {self.dataset.num_episodes}, "
+            f"pending item expects {episode_index}"
+        )
+        # The buffer's index was assigned at creation time, before earlier
+        # pending episodes were saved — fix it up to the real index.
+        episode_buffer['episode_index'] = episode_index
+
+        _t = time.perf_counter()
+        sampled = item.get('sampled') or {}
+        for camera_key in self.video_topics.keys():
+            video_key = f"observation.images.{camera_key}"
+            video_path = self.dataset.root / self.dataset.meta.get_video_file_path(
+                episode_index, video_key
+            )
+            # Videos are encoded to <name>.mp4.tmp; move into place only now
+            # so LeRobot's on-disk mp4-count assertion stays satisfied.
+            tmp_path = video_path.parent / (video_path.name + ".tmp")
+            if tmp_path.exists():
+                os.replace(tmp_path, video_path)
+            if not video_path.exists():
+                logging.warning(f"Video not found: {video_path}, skipping stats for {camera_key}")
+                continue
+            if video_key in sampled:
+                # Stats frames were already sampled on the encode worker
+                episode_buffer[video_key] = sampled[video_key]
+            else:
+                logging.warning(f"No sampled stats frames for {camera_key}")
+        # NOTE: actual stats sampling runs on the encode worker (see the
+        # per-episode "[PERF encode ...]" log line); this only times the
+        # rename + assignment.
+        self._perf['stage2_finalize'] += time.perf_counter() - _t
+
+        _t = time.perf_counter()
+        in_flight_buffer = self.dataset.episode_buffer
+        self.dataset.episode_buffer = episode_buffer
+        try:
+            self.dataset.save_episode()
+        finally:
+            self.dataset.episode_buffer = in_flight_buffer
+        self._perf['dataset_save'] += time.perf_counter() - _t
+
+        logging.info(f"✅ Saved episode {episode_index} with {episode_length} frames")
+        self.logger.info(
+            f"  [PERF cumulative] episode_video_dur={item['video_duration']:.1f}s | "
+            + " | ".join(f"{k}={v:.2f}s" for k, v in sorted(self._perf.items()))
+        )
+
+    def _open_bag_reader(self, rosbag):
+        """Open a bag, falling back to the storage file when metadata.yaml fails.
+
+        An mcap carries its own summary, so a broken metadata.yaml is
+        recoverable for a single-file bag. With several files metadata.yaml is
+        the only record of which belong together — reading one directly would
+        convert part of the recording and report success, so refuse instead.
+        """
+        bag_file = rosbag['bag_file']
+        storage_id = 'mcap' if bag_file.endswith('.mcap') else 'sqlite3'
+
+        def _open(uri):
+            reader = SequentialReader()
+            reader.open(StorageOptions(uri=uri, storage_id=storage_id), ConverterOptions('', ''))
+            return reader
+
+        try:
+            return _open(rosbag['path'])
+        except Exception as dir_err:
+            parts = self._find_bag_files(Path(rosbag['path']))
+            if len(parts) != 1:
+                raise RuntimeError(
+                    f"cannot open via metadata.yaml ({dir_err}); the directory holds "
+                    f"{len(parts)} storage files and metadata.yaml is the only record of "
+                    f"how they fit together, so reading one directly would convert part "
+                    f"of the recording. Repair metadata.yaml for this bag."
+                ) from dir_err
+            try:
+                reader = _open(bag_file)
+            except Exception as file_err:
+                raise RuntimeError(
+                    f"cannot open as a directory ({dir_err}) nor as a file ({file_err})"
+                ) from file_err
+            self.logger.warning(
+                f"  ⚠️ {rosbag['name']}: metadata.yaml unusable ({dir_err}); read "
+                f"{Path(bag_file).name} directly. Single-file bag, so nothing is lost."
+            )
+            return reader
+
+    def convert_single_bag(self, rosbag, task_description: str, ENFORCE_ALL_VIDEO_TOPICS_FLAG: bool, WHOLE_BAG_FLAG: bool = False):
         """Convert a single bag to one or multiple episodes in the dataset."""
         self.logger.info(f"\n=== Processing {rosbag['name']} ===")
+        self._perf = defaultdict(float)
+        _t_bag = time.perf_counter()
 
         # Initialize ROS2 bag reader
         try:
-            bag_file = rosbag['bag_file']
-            storage_id = 'mcap' if bag_file.endswith('.mcap') else 'sqlite3'
-            storage_options = StorageOptions(uri=rosbag['path'], storage_id=storage_id)
-            converter_options = ConverterOptions('','')
-            reader = SequentialReader()
-            reader.open(storage_options, converter_options)
+            reader = self._open_bag_reader(rosbag)
         except Exception as e:
             error_msg = f"Failed to open {rosbag['bag_file']} in {rosbag['name']}: {e}\n"
             error_msg += f"Traceback (most recent call last):\n"
             error_msg += traceback.format_exc()
             self.logger.error(error_msg)
-            return
+            return f"failed to open: {e}"
 
         # Get topic types
         self.topic_types_dict = {}
@@ -477,15 +1461,173 @@ class MultiVideoRosBag2LeRobotConverter:
             if topic_metadata.name in self.all_topics_set:
                 self.topic_types_dict[topic_metadata.name] = topic_metadata.type
 
+        # Cache deserialization classes once per bag (get_message is not free
+        # at ~1M calls per bag)
+        self.topic_msg_class = {
+            t: get_message(ty) for t, ty in self.topic_types_dict.items()
+        }
+        # Drop any raw messages cached from a previous bag
+        self._dirty_state.clear()
+        self._dirty_action.clear()
+
         if ENFORCE_ALL_VIDEO_TOPICS_FLAG is True:
             for video_topic_name in self.video_topics_set:
                 if video_topic_name not in self.topic_types_dict:
                     del reader
                     shutil.rmtree(self.dataset.root/'images', ignore_errors=True)
-                    return
+                    return f"missing video topic {video_topic_name}"
 
-        non_recording_filter = StorageFilter(topics=['/xr/left_hand_inputs'])
-        reader.set_filter(non_recording_filter)
+        # Only pull topics we actually consume from the storage layer — this
+        # skips /tf and other high-rate topics on the C++ side instead of
+        # discarding them one by one in Python.
+        needed_topics = list(self.all_topics_set | {'/xr/left_hand_inputs'})
+        reader.set_filter(StorageFilter(topics=needed_topics))
+
+        # =====================================================================
+        # WHOLE_BAG MODE: Treat entire recording as one continuous episode.
+        #
+        # CRITICAL: Each camera starts buffering video packets from its OWN
+        # first IDR (not from the global sync point). Otherwise, early-synced
+        # cameras lose TRAIL frames during the waiting period, breaking the
+        # GOP and causing snow at the start of their videos.
+        # =====================================================================
+        if WHOLE_BAG_FLAG:
+            self.logger.info("📦 Whole-bag mode: treating entire recording as one episode")
+            self.logger.info("⏳ Waiting for first IDR frame from all cameras...")
+
+            frame_data = dict()
+            packet_buffer = AllIdrVideoBuffer(root_dir=self.dataset.root, fps=self.dataset.fps,
+                                              crf=self.crf, output_sizes=self.output_sizes)
+            self.dataset.episode_buffer = self.dataset.create_episode_buffer()
+
+            episode_state_target_t = None
+            episode_action_target_t = None
+            is_in_adding_phase = False
+            start_time = None
+            idr_synced = False
+            cameras_with_idr = set()      # cameras that have received first IDR
+            expected_cameras = set(self.video_topics.keys())
+
+            while reader.has_next():
+                (topic, data, timestamp) = reader.read_next()
+                timestamp = timestamp / 1e9
+
+                self.update_messages(topic, data)
+
+                camera_key = self.topic_to_camera.get(topic)
+                is_video = camera_key is not None
+
+                # --- Per-camera IDR detection + immediate buffering ---
+                # Each camera starts buffering from its OWN first IDR, even
+                # while other cameras are still waiting. This preserves the
+                # complete per-camera GOP structure.
+                if is_video:
+                    pkt = self._cur_video_packet.get(camera_key)
+                    if pkt is not None:
+                        # Detect first IDR for this camera
+                        if camera_key not in cameras_with_idr and _has_idr(pkt['data']):
+                            cameras_with_idr.add(camera_key)
+                            self.logger.info(
+                                f"  ✅ {camera_key} first IDR at {timestamp:.3f}s "
+                                f"— buffering started"
+                            )
+
+                        # Buffer video packets (starting with its own first IDR)
+                        # for any camera that has seen its first IDR
+                        if camera_key in cameras_with_idr:
+                            packet_buffer.add_packet(
+                                camera_name=camera_key,
+                                packet_data=pkt['data'],
+                                width=pkt['width'],
+                                height=pkt['height'],
+                                codec=pkt['encoding'],
+                                ts=timestamp,
+                            )
+
+                # --- Global IDR sync: all cameras have received first IDR ---
+                if not idr_synced and cameras_with_idr >= expected_cameras:
+                    idr_synced = True
+                    start_time = timestamp
+                    self._episode_ticks = []
+                    episode_state_target_t = start_time + self.frame_duration
+                    episode_action_target_t = episode_state_target_t + ACTION_OFFSET_S
+                    self.logger.info(
+                        f"🔴 All cameras IDR-synced at {start_time:.3f}s. "
+                        f"Starting state/action capture."
+                    )
+                    continue  # Let next iteration handle frame sampling
+
+                # --- Before global sync: only buffer video, skip state/action ---
+                if not idr_synced:
+                    continue
+
+                # --- State/action frame sampling (fps grid, same as old script) ---
+                if timestamp < episode_state_target_t:
+                    continue
+
+                elif episode_state_target_t <= timestamp <= episode_action_target_t and not is_in_adding_phase:
+                    # Only capture state here (video is already buffered above)
+                    self._materialize_state()
+                    frame_data["observation.state"] = self._cur_state_msg.copy()
+                    for camera_key in self.video_topics.keys():
+                        frame_data[f"observation.images.{camera_key}"] = self._get_black_frame(camera_key)
+                    is_in_adding_phase = True
+
+                elif timestamp > episode_action_target_t and is_in_adding_phase:
+                    self.add_action(frame_data)
+                    self.dataset.add_frame(frame_data, task_description,
+                                           episode_state_target_t - start_time - self.frame_duration)
+                    frame_data.clear()
+                    self._episode_ticks.append(
+                        round((episode_state_target_t - start_time) / self.frame_duration) - 1)
+
+                    time_gap = timestamp - episode_action_target_t
+                    skipped_frames = time_gap // self.frame_duration
+
+                    if skipped_frames > 0:
+                        self.logger.warning(
+                            f"  ⚠️ {int(skipped_frames)} tick(s) lost to a "
+                            f"{time_gap * 1000:.0f}ms message gap at "
+                            f"t={episode_state_target_t - start_time:.3f}s in-episode"
+                        )
+                    episode_state_target_t += (skipped_frames + 1) * self.frame_duration
+                    episode_action_target_t = episode_state_target_t + ACTION_OFFSET_S
+                    is_in_adding_phase = False
+
+                elif timestamp > episode_action_target_t and not is_in_adding_phase:
+                    time_gap = timestamp - episode_action_target_t
+                    skipped_frames = time_gap // self.frame_duration + 1
+
+                    self.logger.warning(
+                        f"  ⚠️ {int(skipped_frames)} tick(s) dropped: state window at "
+                        f"t={episode_state_target_t - start_time:.3f}s in-episode was "
+                        f"silent — row and video slot skipped together"
+                    )
+                    episode_state_target_t += skipped_frames * self.frame_duration
+                    episode_action_target_t = episode_state_target_t + ACTION_OFFSET_S
+
+                    frame_data.clear()
+
+            # Finalize the single whole-bag episode
+            end_time = timestamp
+            self._submit_episode(packet_buffer, start_time, end_time, task_description)
+            self._drain_pending(block=True)
+
+            del reader
+            shutil.rmtree(self.dataset.root/'images', ignore_errors=True)
+            return None
+
+        # =====================================================================
+        # X/Y MARKER MODE: Joy-based episode detection.
+        # Buffers ALL video packets during recording (same as whole_bag mode)
+        # to preserve the complete GOP for proper ffmpeg decoding.
+        #
+        # A sliding window of recent video packets lets each episode start
+        # from the last IDR before the X press. Joy messages are used for
+        # X/Y detection inline.
+        # =====================================================================
+        WINDOW_SIZE = 60
+        recent_packets = {ck: deque(maxlen=WINDOW_SIZE) for ck in self.video_topics.keys()}
 
         x_button, y_button = 2, 3
         is_recording = False
@@ -496,11 +1638,66 @@ class MultiVideoRosBag2LeRobotConverter:
         episode_action_target_t = None
         is_in_adding_phase = False
 
+        # Episode just stopped by Y; submission held until the failure-tap window resolves.
+        pending_stop = None
+
+        def _finalize_pending_stop():
+            nonlocal pending_stop
+            if pending_stop is None:
+                return
+            taps = pending_stop['taps']
+            if taps >= Y_FAILURE_TAP_COUNT:
+                self.dataset.clear_episode_buffer()
+                pending_stop['packet_buffer'].clear()
+                self.logger.warning(f"  🗑️ Episode discarded: operator marked it failed ({taps}x Y)")
+            else:
+                if taps == 2:
+                    self.logger.warning(
+                        "  ⚠️ Got exactly 2 Y taps (1=normal stop, 3=failed) — "
+                        "ambiguous, keeping episode as successful; please double-check"
+                    )
+                self._submit_episode(
+                    pending_stop['packet_buffer'], pending_stop['start_time'],
+                    pending_stop['end_time'], task_description
+                )
+            pending_stop = None
+
         while reader.has_next():
+            _t = time.perf_counter()
             (topic, data, timestamp) = reader.read_next()
+            self._perf['read_next'] += time.perf_counter() - _t
             timestamp = timestamp / 1e9
 
+            if pending_stop is not None and timestamp - pending_stop['last_tap_t'] >= Y_FAILURE_TAP_WINDOW_S:
+                _finalize_pending_stop()
+
+            _t = time.perf_counter()
             self.update_messages(topic, data)
+            self._perf['update_messages'] += time.perf_counter() - _t
+
+            # --- Maintain sliding window of recent video packets ---
+            camera_key = self.topic_to_camera.get(topic)
+            if camera_key:
+                pkt = self._cur_video_packet.get(camera_key)
+                if pkt is not None:
+                    recent_packets[camera_key].append({
+                        'ts': timestamp,
+                        'data': pkt['data'],
+                        'width': pkt['width'],
+                        'height': pkt['height'],
+                        'encoding': pkt['encoding'],
+                    })
+
+                    # --- Buffer ALL video packets during recording (full GOP) ---
+                    if is_recording and packet_buffer is not None:
+                        packet_buffer.add_packet(
+                            camera_name=camera_key,
+                            packet_data=pkt['data'],
+                            width=pkt['width'],
+                            height=pkt['height'],
+                            codec=pkt['encoding'],
+                            ts=timestamp,
+                        )
 
             if topic == '/xr/left_hand_inputs':
                 try:
@@ -509,116 +1706,84 @@ class MultiVideoRosBag2LeRobotConverter:
                     if len(buttons) > max(x_button, y_button):
                         if previous_buttons is not None:
                             if   (previous_buttons[x_button] == 0 and buttons[x_button] == 1 and not is_recording):
+                                _finalize_pending_stop()
+
                                 is_recording = True
-                                reader.reset_filter()
                                 start_time = timestamp
                                 self.logger.info(f"🔴 Start #Episode: {self.num_xy_pairs}")
 
                                 episode_state_target_t = start_time + self.frame_duration
-                                episode_action_target_t = episode_state_target_t + ACTION_OFFSET_RATIO * self.frame_duration
+                                episode_action_target_t = episode_state_target_t + ACTION_OFFSET_S
 
                                 is_in_adding_phase = False
                                 frame_data.clear()
+                                packet_buffer = self._start_episode_capture(recent_packets, start_time)
 
-                                self.dataset.episode_buffer = self.dataset.create_episode_buffer()
-                                packet_buffer = VideoPacketBuffer(root_dir=self.dataset.root, fps=self.dataset.fps)
-                                
                             elif (previous_buttons[x_button] == 0 and buttons[x_button] == 1 and is_recording):
                                 is_recording = True
                                 start_time = timestamp
                                 self.logger.info(f"🔴 Re-record #Episode: {self.num_xy_pairs}")
 
                                 episode_state_target_t = start_time + self.frame_duration
-                                episode_action_target_t = episode_state_target_t + ACTION_OFFSET_RATIO * self.frame_duration
+                                episode_action_target_t = episode_state_target_t + ACTION_OFFSET_S
 
                                 self.dataset.clear_episode_buffer()
-                                packet_buffer.clear()
-
-                                self.dataset.episode_buffer = self.dataset.create_episode_buffer()
-                                packet_buffer = VideoPacketBuffer(root_dir=self.dataset.root, fps=self.dataset.fps)
 
                                 is_in_adding_phase = False
                                 frame_data.clear()
+                                packet_buffer = self._start_episode_capture(recent_packets, start_time)
 
                             if (previous_buttons[y_button] == 0 and buttons[y_button] == 1 and is_recording):
                                 is_recording = False
-                                reader.set_filter(non_recording_filter)
                                 end_time = timestamp
-                                duration = end_time - start_time
-                                self.logger.info(f"⏹️ Stop TimeRange: {start_time:.3f} to {end_time:.3f} seconds. Duration: {duration:.3f} seconds")
-
-                                self.num_xy_pairs += 1
-
-                                if packet_buffer.episodeLength < MIN_EPISODE_LENGTH or self.dataset.episode_buffer["size"] < MIN_EPISODE_LENGTH:
-                                    self.dataset.clear_episode_buffer()
-                                    packet_buffer.clear()
-
-                                else:
-                                    if   packet_buffer.episodeLength > self.dataset.episode_buffer["size"]:
-                                        for camera_key in self.video_topics.keys():
-                                            packet_buffer.delete_final_packet(camera_key)
-
-                                    elif packet_buffer.episodeLength < self.dataset.episode_buffer["size"]:
-                                        self.dataset.delete_final_frame()
-
-                                    self.realign_timestamps()
-
-                                    episode_length = packet_buffer.episodeLength
-                                    packet_buffer.save_episode(
-                                        episode_index= self.dataset.num_episodes,
-                                        dataset_meta = self.dataset.meta,
-                                    )
-                                    packet_buffer.clear()
-
-                                    for camera_key in self.video_topics.keys():
-                                        video_key = f"observation.images.{camera_key}"
-
-                                        height, width, _ = self.get_camera_resolution(camera_key)
-
-                                        video_path = self.dataset.root / self.dataset.meta.get_video_file_path(
-                                            self.dataset.num_episodes, video_key
-                                        )
-
-                                        if not video_path.exists():
-                                            logging.warning(f"Video not found: {video_path}, skipping stats for {camera_key}")
-                                            continue
-                                        try:
-                                            sampled_frames = sample_frames_from_video(
-                                                video_path=video_path,
-                                                episode_length=episode_length,
-                                                fps=self.dataset.fps,
-                                                width=width,
-                                                height=height,
-                                            )
-                                            self.dataset.episode_buffer[video_key] = sampled_frames
-
-                                            logging.info(f"Replaced {camera_key} PNG paths with {len(sampled_frames)} sampled frames")
-                                        except Exception as e:
-                                            error_msg = f"Failed to sample frames from {camera_key}: {e}\n"
-                                            error_msg += f"Traceback (most recent call last):\n"
-                                            error_msg += traceback.format_exc()
-                                            logging.error(error_msg)
-
-                                    self.dataset.save_episode()
-                                    logging.info(f"✅ Saved episode {self.dataset.num_episodes} with {episode_length} frames")
+                                pending_stop = {
+                                    'packet_buffer': packet_buffer,
+                                    'start_time': start_time,
+                                    'end_time': end_time,
+                                    'taps': 1,
+                                    'last_tap_t': end_time,
+                                }
 
                                 episode_state_target_t = None
                                 episode_action_target_t = None
 
+                            elif (previous_buttons[y_button] == 0 and buttons[y_button] == 1
+                                  and not is_recording and pending_stop is not None):
+                                pending_stop['taps'] += 1
+                                pending_stop['last_tap_t'] = timestamp
+
                         previous_buttons = list(buttons)
-                
+
                 except Exception as e:
                     error_msg = f"Error processing Joy message: {e}\n"
                     error_msg += f"Traceback (most recent call last):\n"
                     error_msg += traceback.format_exc()
                     self.logger.error(error_msg)
 
+            # Save episodes whose background encode has finished. Kept OUTSIDE
+            # the Joy try/except so a save failure is fatal instead of being
+            # swallowed per-message (which would desync episode indices).
+            if self._pending:
+                self._drain_pending(block=False)
+
+                submitted = self.dataset.num_episodes + len(self._pending)
+                if self.max_episodes and submitted >= self.max_episodes:
+                    self.logger.info(f"Reached --max_episodes={self.max_episodes}, stopping")
+                    self._drain_pending(block=True)
+                    del reader
+                    shutil.rmtree(self.dataset.root/'images', ignore_errors=True)
+                    return None
+
             if is_recording:
                 if   timestamp < episode_state_target_t:
                     continue
 
                 elif episode_state_target_t <= timestamp <= episode_action_target_t and not is_in_adding_phase:
-                    self.add_state_and_video_packet(frame_data, packet_buffer)
+                    # Only capture state (video is already buffered above)
+                    self._materialize_state()
+                    frame_data["observation.state"] = self._cur_state_msg.copy()
+                    for camera_key in self.video_topics.keys():
+                        frame_data[f"observation.images.{camera_key}"] = self._get_black_frame(camera_key)
                     is_in_adding_phase = True
 
                 elif timestamp > episode_action_target_t and is_in_adding_phase:
@@ -626,29 +1791,54 @@ class MultiVideoRosBag2LeRobotConverter:
                     self.dataset.add_frame(frame_data, task_description,
                                            episode_state_target_t - start_time - self.frame_duration)
                     frame_data.clear()
+                    self._episode_ticks.append(
+                        round((episode_state_target_t - start_time) / self.frame_duration) - 1)
 
                     time_gap = timestamp - episode_action_target_t
                     skipped_frames = time_gap // self.frame_duration
 
+                    if skipped_frames > 0:
+                        self.logger.warning(
+                            f"  ⚠️ {int(skipped_frames)} tick(s) lost to a "
+                            f"{time_gap * 1000:.0f}ms message gap at "
+                            f"t={episode_state_target_t - start_time:.3f}s in-episode"
+                        )
                     episode_state_target_t += (skipped_frames + 1) * self.frame_duration
-                    episode_action_target_t = episode_state_target_t + ACTION_OFFSET_RATIO * self.frame_duration
+                    episode_action_target_t = episode_state_target_t + ACTION_OFFSET_S
                     is_in_adding_phase = False
 
                 elif timestamp > episode_action_target_t and not is_in_adding_phase:
                     time_gap = timestamp - episode_action_target_t
                     skipped_frames = time_gap // self.frame_duration + 1
 
+                    self.logger.warning(
+                        f"  ⚠️ {int(skipped_frames)} tick(s) dropped: state window at "
+                        f"t={episode_state_target_t - start_time:.3f}s in-episode was "
+                        f"silent — row and video slot skipped together"
+                    )
                     episode_state_target_t += skipped_frames * self.frame_duration
-                    episode_action_target_t = episode_state_target_t + ACTION_OFFSET_RATIO * self.frame_duration
+                    episode_action_target_t = episode_state_target_t + ACTION_OFFSET_S
 
                     frame_data.clear()
 
+        # Bag ended before the burst window closed on the last stop — settle it now.
+        _finalize_pending_stop()
+
+        # Wait for all in-flight episode encodes and save them
+        self._drain_pending(block=True)
+
         del reader
         shutil.rmtree(self.dataset.root/'images', ignore_errors=True)
+        self.logger.info(
+            f"[PERF bag total] wall={time.perf_counter() - _t_bag:.2f}s | "
+            + " | ".join(f"{k}={v:.2f}s" for k, v in sorted(self._perf.items()))
+        )
+        return None
 
 
-    def convert_all(self, task_description: str, MULTIBAG_FLAG: bool, ENFORCE_ALL_VIDEO_TOPICS_FLAG: bool):
+    def convert_all(self, task_description: str, MULTIBAG_FLAG: bool, ENFORCE_ALL_VIDEO_TOPICS_FLAG: bool, WHOLE_BAG_FLAG: bool = False):
         """Convert all discovered rosbags to a multi-episode dataset."""
+        self._t_start = time.time()
         self.logger.info(f"Starting multi-bag conversion: {self.input_directory}")
 
         # Discover all rosbags
@@ -661,17 +1851,45 @@ class MultiVideoRosBag2LeRobotConverter:
         # Create the dataset
         self.create_dataset_if_needed()
 
-        # Convert each rosbag
+        # Convert each rosbag. A bag that does not convert is reported and
+        # counted: silently dropping it leaves a dataset quietly short of those
+        # episodes, with nothing but one line in a long log to say so.
         processed_rosbags = 0
+        skipped: list[tuple[str, str]] = []
         for rosbag in rosbags:
-            self.convert_single_bag(rosbag, task_description, ENFORCE_ALL_VIDEO_TOPICS_FLAG)
+            reason = self.convert_single_bag(
+                rosbag, task_description, ENFORCE_ALL_VIDEO_TOPICS_FLAG, WHOLE_BAG_FLAG
+            )
             processed_rosbags += 1
-            self.logger.info(f"[{processed_rosbags}/{total_rosbags}] Finished processing rosbag: {rosbag.get('name')}")
+            if reason is None:
+                self.logger.info(f"[{processed_rosbags}/{total_rosbags}] Finished processing rosbag: {rosbag.get('name')}")
+            else:
+                skipped.append((str(rosbag.get('name')), reason))
+                self.logger.error(
+                    f"[{processed_rosbags}/{total_rosbags}] SKIPPED rosbag: "
+                    f"{rosbag.get('name')} — {reason}"
+                )
+
+        # All per-bag work is drained; shut the encode workers down cleanly
+        self._encode_pool.shutdown(wait=True)
 
         # Final summary
-        self.logger.info(f"\n🎉 Multi-bag conversion complete!")
+        elapsed = time.time() - self._t_start
+        converted = total_rosbags - len(skipped)
+        if skipped:
+            self.logger.error(f"\n⚠️ Multi-bag conversion finished with {len(skipped)} skipped bag(s)!")
+        else:
+            self.logger.info(f"\n🎉 Multi-bag conversion complete!")
         self.logger.info(f"   Dataset: {self.output_repo_id}")
+        self.logger.info(f"   Bags: {converted}/{total_rosbags} converted")
         self.logger.info(f"   Episodes: {self.dataset.num_episodes} successful")
+        self.logger.info(f"   Total time: {elapsed:.1f}s")
+        if skipped:
+            self.logger.error(f"   {len(skipped)} bag(s) produced no episodes:")
+            for name, reason in skipped:
+                self.logger.error(f"     - {name}: {reason}")
+            return False
+        return True
 
 
 def setup_logging_to_file(log_file_path):
@@ -720,14 +1938,28 @@ def setup_logging_to_file(log_file_path):
     return log_file
 
 
+def parse_size(value):
+    """'1920x960' -> (1920, 960); 'source' -> None (keep the source size).
+    Both sides even, as yuv420 requires."""
+    if value.strip().lower() in ("source", "original"):
+        return None
+    match = re.fullmatch(r"(\d+)[xX*](\d+)", value.strip())
+    if not match:
+        raise argparse.ArgumentTypeError(f"expected WIDTHxHEIGHT, e.g. 1920x960, got {value!r}")
+    width, height = int(match[1]), int(match[2])
+    if width <= 0 or height <= 0 or width % 2 or height % 2:
+        raise argparse.ArgumentTypeError(f"{value}: width and height must be positive even numbers")
+    return width, height
+
+
 def main():
-    parser = argparse.ArgumentParser(description="Convert multiple ROS2 bags to LeRobot dataset with video support")
+    parser = argparse.ArgumentParser(description="Convert multiple ROS2 bags to LeRobot dataset with all-IDR video re-encoding")
     parser.add_argument("--multibag",
                         action="store_true", # If not in command, defaults to false
                         help="Whether input_directory contains multiple rosbags, pass True if yes, False if no")
     parser.add_argument("--enforce_all_video_topics",
                         action="store_true", # If not in command, defaults to false
-                        help="Enforce that rosbag must have all video topics, if you don't want to enforce this, you can comment out unwanted topics in self.video_topics")
+                        help="Enforce that rosbag must have four video topics, if you don't want to enforce this, you can comment out unwanted topics in self.video_topics")
     parser.add_argument("--input_directory",
                         default="./data/rosbags",
                         help="Directory containing ROS2 bag segments")
@@ -735,45 +1967,98 @@ def main():
                         default="output/dataset",
                         help="Output dataset repo ID")
     parser.add_argument("--fps", type=int,
-                        default=30,
+                        default=45,
                         help="Target FPS for dataset")
     parser.add_argument("--task",
                         default="task description",
                         help="Task description")
+    parser.add_argument("--whole_bag",
+                        action="store_true",
+                        help="Treat the entire rosbag as one continuous episode (no X/Y markers needed)")
+    parser.add_argument("--head_resolution", type=parse_size, default=(1920, 960), metavar="WIDTHxHEIGHT",
+                        help="Size of the head camera video (default: 1920x960, half the "
+                             "3840x1920 source); 'source' keeps the source size")
+    parser.add_argument("--wrist_resolution", type=parse_size, default=None, metavar="WIDTHxHEIGHT",
+                        help="Size of both wrist camera videos (left_color, right_color), e.g. "
+                             "1280x400 (default: keep the source size, 2560x800)")
+    parser.add_argument("--crf", type=int,
+                        default=23,
+                        help="CRF quality for libx265 re-encoding (lower=better quality, default: 23)")
+    parser.add_argument("--max_episodes", type=int, default=None,
+                        help="Stop after N episodes (for quick testing)")
+    parser.add_argument("--nvenc_sessions", type=int, default=7,
+                        help="Max concurrent NVENC encode sessions; lower to 5/3 on "
+                             "drivers older than 550/522 if GPU encodes fail (default: 7)")
+    parser.add_argument("--vaapi_sessions", type=int, default=4,
+                        help="Max concurrent VA-API encode sessions per render node; "
+                             "4 saturates an Arc B-series GPU at 2560x800 (default: 4)")
+    parser.add_argument("--verbose", action="store_true",
+                        help="Print progress to terminal instead of log file")
     parser.add_argument("--log_file",
                         default=None,
                         help="Log file path (default: convert_rosbag_to_lerobot_YYYYMMDD_HHMMSS.log in script directory)")
     args = parser.parse_args()
 
-    # Set log file path
-    if args.log_file is None:
-        script_dir = Path(__file__).parent
-        logs_dir = script_dir / "logs"
-        logs_dir.mkdir(exist_ok=True)
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        log_file_path = logs_dir / f"convert_rosbag_to_lerobot_{timestamp}.log"
+    global _VIDEO_BACKEND, _VIDEO_DEVICES, _ENCODE_SESSIONS
+    _VIDEO_BACKEND, _VIDEO_DEVICES = _detect_video_backend()
+    if _VIDEO_BACKEND == "nvidia":
+        _ENCODE_SESSIONS = threading.BoundedSemaphore(max(1, args.nvenc_sessions))
+    elif _VIDEO_BACKEND == "vaapi":
+        _ENCODE_SESSIONS = threading.BoundedSemaphore(
+            max(1, args.vaapi_sessions) * max(1, len(_VIDEO_DEVICES))
+        )
     else:
-        log_file_path = Path(args.log_file)
+        _ENCODE_SESSIONS = threading.BoundedSemaphore(1)
+    output_sizes = {'head_camera': args.head_resolution,
+                    'left_color': args.wrist_resolution, 'right_color': args.wrist_resolution}
+    output_sizes = {camera: size for camera, size in output_sizes.items() if size}
 
-    # Set up log redirection
-    log_file = setup_logging_to_file(log_file_path)
-
-    try:
+    if args.verbose:
+        # Terminal mode: normal logging to stdout. force=True because imported
+        # modules (ROS/lerobot) install their own root handler first, which
+        # would otherwise make basicConfig a no-op and swallow INFO logs.
+        logging.basicConfig(
+            level=logging.INFO,
+            format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+            force=True,
+        )
         if not os.path.exists(args.input_directory):
             print(f"Error: Input directory {args.input_directory} not found!")
             sys.exit(1)
+        converter = MultiVideoRosBag2LeRobotConverter(args.input_directory, args.output, args.fps,
+                                                      crf=args.crf, output_sizes=output_sizes)
+        converter.max_episodes = args.max_episodes
+        if not converter.convert_all(args.task, args.multibag, args.enforce_all_video_topics, args.whole_bag):
+            sys.exit(1)
+    else:
+        # Log file mode: redirect to file (original behavior)
+        if args.log_file is None:
+            script_dir = Path(__file__).parent
+            logs_dir = script_dir / "logs"
+            logs_dir.mkdir(exist_ok=True)
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            log_file_path = logs_dir / f"convert_rosbag_to_lerobot_{timestamp}.log"
+        else:
+            log_file_path = Path(args.log_file)
 
-        converter = MultiVideoRosBag2LeRobotConverter(args.input_directory, args.output, args.fps)
-        converter.convert_all(args.task, args.multibag, args.enforce_all_video_topics)
-    finally:
-        # Restore original stdout and stderr
-        sys.stdout.flush()
-        sys.stderr.flush()
-        log_file.close()
-        sys.stdout = sys.__stdout__
-        sys.stderr = sys.__stderr__
+        log_file = setup_logging_to_file(log_file_path)
+        ok = False
+        try:
+            if not os.path.exists(args.input_directory):
+                print(f"Error: Input directory {args.input_directory} not found!")
+                sys.exit(1)
+            converter = MultiVideoRosBag2LeRobotConverter(args.input_directory, args.output, args.fps,
+                                                          crf=args.crf, output_sizes=output_sizes)
+            ok = converter.convert_all(args.task, args.multibag, args.enforce_all_video_topics, args.whole_bag)
+        finally:
+            sys.stdout.flush()
+            sys.stderr.flush()
+            log_file.close()
+            sys.stdout = sys.__stdout__
+            sys.stderr = sys.__stderr__
+        if not ok:
+            sys.exit(1)
 
 
 if __name__ == "__main__":
     main()
-    
