@@ -14,6 +14,17 @@
 
 镜像 tar 和 `SHA256SUMS` 由培训方提供，拿到后放在同一目录。镜像加载后约 21.2 GB；输出数据集按输入 bag 的约 6 倍预留空间。使用 `960x480` / `1280x400` 时，视频体积约为默认分辨率的 1/4。
 
+### 1.1 从 GitHub 获取代码
+
+不用 U 盘里的代码时，可以直接克隆 B70 分支：
+
+```bash
+git clone -b B70 https://github.com/dexteleop/rosbag_to_dataset_TA2.git
+cd rosbag_to_dataset_TA2
+git config --local submodule.lerobot.url https://github.com/zhou-yh19/lerobot.git
+GIT_LFS_SKIP_SMUDGE=1 git submodule update --init --recursive --depth 1
+```
+
 ## 2. 前置条件
 
 - Linux x86_64，Docker 可用。
